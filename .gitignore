@@ -1,0 +1,107 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+api_keys.txt
+credentials*.json
+service_account*.json
+token*.json
+token*.pickle
+key.json
+key.py
+draftKey.json
+draftBuilder.json
+*.pickle
+*.pickle"
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Data and cache files
+cache/
+simple_cache/
+recurring_cache/
+la_cache/
+pa_cache/
+text_cache/
+*.csv
+*.zip
+*.tar
+*.gz
+
+# Downloaded files
+downloaded_files/
+downloaded_attachments/
+downloaded_esbd_files/
+bonfire_downloads/
+esbd_downloads/
+esbd_inspection/
+la_downloads/
+nc_downloads/
+pa_downloads/
+georgia_solicitations/
+georgia_debug/
+piee_debug/
+contracts/
+recurring_contracts/
+extracted_text/
+contract_text_dumps/
+output/
+proposals/
+
+# Analysis output
+analysis_results/
+procurement_analysis_results/
+model_comparison_results/
+disagreement_analysis/
+contract_analysis_results.json
+all_proposals.txt
+
+# Node / Next.js (recursive)
+**/node_modules/
+**/.next/
+.env.local
+
+# IDE and OS
+.cursor/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Misc data files
+*.C4
+*.TXT
+*.log
+*.debug.jsonl
+bulk_analyze_status.json
+*.html
+*.xlsx
+*.pdf
+debug_*.json
+openai_file_cache.json
+nc_solicitations_data.json
+solicitationUiText.json
+response_parse_error_*.html
+response_timeout_*.html
+
+# Large/binary directories
+python-lambda-layer/
+5330 014476401/
+checkSubmissionDates.zip
+
+# Embedded git repos (subfolders with their own .git)
+TX-Buy/
+newEmailDashboard/
+proposalWriter/
+
+# Test and debug data
+test/
