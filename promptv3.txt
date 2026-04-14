@@ -1,0 +1,131 @@
+TASK: Source Vendors for Government Solicitation
+
+Objective
+Identify and compile a list of vendors capable of fulfilling the scope of a government solicitation. Before sourcing, first classify the scope of work to determine whether geographic proximity is required or irrelevant — then apply the appropriate search strategy.
+
+Step 1: Geographic Classification (Do This First)
+Before searching for any vendors, read the scope of work and classify it into one of two categories:
+🔴 Location-Dependent Scope (Local Vendors Only)
+Apply the 200-mile radius filter when the work requires physical presence at the place of performance. This includes:
+Installation, construction, or demolition at a site
+Roofing, flooring, painting, or facility repairs
+Rigging, equipment moving, or on-site assembly
+Hazmat disposal or environmental remediation at a location
+HVAC, plumbing, electrical, or mechanical services
+Any scope where a technician, crew, or equipment must travel to and remain at the job site
+Rule: If the vendor must show up in person to do the work, restrict your search to within 200 miles of the place of performance.
+
+🟢 Location-Agnostic Scope (National Vendors Eligible)
+Do not apply a geographic filter when the scope can be fulfilled remotely or via shipping. This includes:
+Products that can be shipped (e.g., canopy tents, electronics, furniture, supplies, equipment)
+Software, digital services, or remote consulting
+Manufacturing or fabrication of goods that are then delivered
+Staffing or professional services performed remotely
+Any scope where the vendor never needs to visit the place of performance
+Rule: If the vendor can ship a product or perform the work without being on-site, search nationally and do not restrict by radius. This maximizes competition and quote volume.
+
+Step 2: Deliverables
+Section 1 — Vendor List
+For each vendor, provide:
+Company Name
+Verified Email Address (no bounces)
+Phone Number
+Location (City, State)
+Scope Fit (Supply Only / Install Only / Supply + Install / Full Scope)
+Section 2 — Cold Outreach Email
+A single ready-to-send email using the template in Step 5. Emails must be:
+Verified and active
+Separated by semicolons (;)
+Free of generic or unverified addresses unless clearly listed as primary contact
+
+Step 3: Core Requirements
+Requirement
+Detail
+Geographic Scope
+200-mile radius for location-dependent work; national for shippable/remote work
+Capabilities
+Must match the exact scope of work
+Government Experience
+Not required
+Volume Target
+Minimum 50 vendors (or maximum available if fewer exist)
+Business Type
+Prioritize local and national small-to-medium businesses
+Source Quality
+No login-required platforms; no duplicates; no bounce-prone emails
+
+
+Step 4: Search Strategy
+4A. Keyword Expansion by Scope
+Break the requirement into multiple trade categories and synonyms before searching.
+Examples by trade:
+Construction & Fabrication: general contractor, commercial contractor, steel fabricator, welding shop, sheet metal contractor
+Equipment & Installation: machinery movers, rigging contractor, industrial equipment installer
+Environmental & Hazmat: hazardous waste disposal, spill response, industrial cleaning
+Facilities & Maintenance: facility management, janitorial services, commercial cleaning
+Specialty Trades: HVAC installer, piping contractor, pump repair, tank cleaning
+Products & Supply: commercial tent supplier, canopy manufacturer, furniture wholesaler, equipment distributor
+Use 3–5 keyword variations per trade category.
+
+4B. Localized Search Format (Location-Dependent Only)
+Use 15–20+ nearby cities and counties within the 200-mile radius.
+Examples:
+“steel fabrication Austin TX”
+“industrial cleaning Travis County”
+“rigging contractor San Antonio TX”
+
+4C. National Search Format (Location-Agnostic Only)
+Broaden search to national suppliers and distributors.
+Examples:
+“commercial canopy tent supplier USA”
+“bulk office furniture vendor government”
+“industrial equipment distributor nationwide”
+Mix small niche vendors with larger national distributors to maximize coverage.
+
+4D. Data Sources
+Pull vendors from:
+Google (site:.com OR site:.net)
+Yelp (category + location)
+Yellow Pages / Manta
+BBB.org
+Local and national Chamber of Commerce directories
+Industry associations (contractors, environmental groups, trade orgs)
+Manufacturer and distributor directories for product-based scopes
+
+4E. Email Extraction Methods
+Contact / About pages
+Visible email listings
+mailto: links
+Page source search (@domain.com)
+
+Step 5: Cold Outreach Email Template
+Subject: Request for Quote: [Job Type] ([NoticeID]-[DueMinus2Days])**This is very important you need to format it this way**
+Body:
+Hi,
+I'm requesting a quote for [brief job type] at [full location]. Scope includes: [1–2 key specs only — e.g., size, material, equipment, timeline]. Please confirm availability and let us know if you can send a quote by [Due Date – 2 days].
+Thanks,
+Avinash Nayak
+Chief Operating Officer — XL Eagle
+📧 info@xleagle.com
+📞 (608) 999-1679
+📍 2021 Guadalupe St, Suite 260, Austin, TX 78705
+🌐 www.xleaglegov.com
+
+Step 6: Quality Control Checklist
+Before finalizing the vendor list, verify:
+Geographic classification was made before searching (local vs. national)
+No duplicate vendors
+No broken or unverified emails
+Valid phone numbers for all entries
+Mixed-scope vendors are clearly labeled
+Minimum 50 vendors reached (or documented reason if fewer exist)
+No NSN or government solicitation language (like solicitation number) used in the outreach email
+Email includes only essential specs needed for accurate quoting
+
+Notes
+Do not mention NSN or government solicitation number or language anywhere in the email
+Include only essential specs needed for accurate quoting — no filler
+Keep tone short, clear, and easy to reply to
+When in doubt about geographic classification, default to national to maximize quote volume — you can always filter down later
+
+
