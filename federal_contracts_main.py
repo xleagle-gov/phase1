@@ -89,6 +89,7 @@ def fetch_contracts(posted_from, posted_to, use_cache=True):
         }
         
         response = requests.get(BASE_URL, params=params)
+        print(response.text)
         
         if response.status_code == 200:
             data = response.json()
@@ -127,12 +128,42 @@ def setup_google_sheet():
         print(f"Error setting up Google Sheets: {e}")
         return None
 
+def load_sheet_state(wks):
+    """
+    Read the entire sheet once and return a lookup of existing URLs
+    plus the next available row number.
+
+    Returns (url_to_row, next_empty_row) where:
+      url_to_row  – dict mapping Sam Link → (row_num, record_dict)
+      next_empty_row – first empty row (or row after the last non-empty one)
+    """
+    try:
+        records = wks.get_all_records()
+    except Exception as e:
+        print(f"Error reading sheet state: {e}")
+        return {}, 2
+
+    url_to_row = {}
+    first_empty = None
+    last_non_empty = 1
+
+    for i, record in enumerate(records, start=2):
+        link = (record.get('Sam Link') or '').strip()
+        if link:
+            url_to_row[link] = (i, record)
+            last_non_empty = i
+        elif first_empty is None:
+            first_empty = i
+
+    next_empty = first_empty if first_empty else last_non_empty + 1
+    return url_to_row, next_empty
+
+
 def find_link_in_sheet(wks, url):
     """Find if a URL already exists in the sheet and return row number."""
     try:
-        # Get all records to search for the URL
         records = wks.get_all_records()
-        for i, record in enumerate(records, start=2):  # Start at 2 because row 1 is headers
+        for i, record in enumerate(records, start=2):
             if record.get('Sam Link') == url:
                 return i, record
         return None, None
@@ -186,6 +217,21 @@ def add_or_update_sheet(wks, url, result_data, contract_data=None, row_num=None)
         print(f"Error updating sheet: {e}")
         return False, None
 
+def _find_next_empty_row(wks):
+    """Scan the sheet and return the first empty row (by Sam Link column).
+    Must be called under sheet_lock so two workers never get the same row."""
+    records = wks.get_all_records()
+    first_empty = None
+    last_non_empty = 1
+    for i, record in enumerate(records, start=2):
+        link = (record.get('Sam Link') or '').strip()
+        if link:
+            last_non_empty = i
+        elif first_empty is None:
+            first_empty = i
+    return first_empty if first_empty else last_non_empty + 1
+
+
 def process_contracts_to_sheet(contracts):
     """
     Process filtered contracts:
@@ -199,8 +245,35 @@ def process_contracts_to_sheet(contracts):
         print("Failed to setup Google Sheets. Skipping sheet operations.")
         return
 
-    print("Getting Google Drive access token...")
-    access_token = get_drive_access_token()
+    # ------------------------------------------------------------------
+    # Bulk-check: read the sheet ONCE to filter out already-processed URLs
+    # ------------------------------------------------------------------
+    print("Loading existing sheet data for duplicate check...")
+    url_to_row, _ = load_sheet_state(wks)
+
+    already_skipped = 0
+    new_contracts = []
+    preloaded_rows = {}
+
+    for contract in contracts:
+        url = (contract.get('uiLink') or '').strip()
+        if not url:
+            continue
+        if url in url_to_row:
+            row_num, record = url_to_row[url]
+            status = str(record.get('getEmails', '')).strip().lower()
+            if status and status != 'processing...':
+                already_skipped += 1
+                continue
+            preloaded_rows[url] = row_num
+        new_contracts.append(contract)
+
+    print(f"Already processed in sheet: {already_skipped} (skipped)")
+    print(f"Remaining to process: {len(new_contracts)}")
+
+    if not new_contracts:
+        print("All contracts already processed. Nothing to do.")
+        return
 
     print("Authenticating Gmail client...")
     gmail_client = GmailClient(NEXAN_ACCOUNT_CONFIG)
@@ -210,33 +283,38 @@ def process_contracts_to_sheet(contracts):
 
     workers = 1 if TEST_SINGLE_CONTRACT else 3
     if TEST_SINGLE_CONTRACT:
-        print(f"\n=== TEST MODE: Processing {len(contracts)} contracts sequentially until first full success ===")
+        print(f"\n=== TEST MODE: Processing {len(new_contracts)} contracts sequentially until first full success ===")
     else:
-        print(f"\n=== Processing {len(contracts)} contracts ({workers} in parallel) ===")
+        print(f"\n=== Processing {len(new_contracts)} contracts ({workers} in parallel) ===")
 
     sheet_lock = threading.Lock()
     test_done = threading.Event() if TEST_SINGLE_CONTRACT else None
 
-    def _mark_skipped_in_sheet(url, status_msg, row_num=None):
-        """Write a skipped/failed contract to the sheet so it won't be reprocessed."""
-        try:
-            if row_num:
-                wks.update_value(f'K{row_num}', status_msg)
-            else:
-                records = wks.get_all_records()
-                empty_row = None
-                last_non_empty_row = 1
-                for i, record in enumerate(records, start=2):
-                    if record.get('Sam Link') and record.get('Sam Link').strip() != '':
-                        last_non_empty_row = i
-                    elif not empty_row and (not record.get('Sam Link') or record.get('Sam Link').strip() == ''):
-                        empty_row = i
-                target_row = empty_row if empty_row else last_non_empty_row + 1
-                wks.update_value(f'B{target_row}', url)
-                wks.update_value(f'K{target_row}', status_msg)
-            time.sleep(1)
-        except Exception as e:
-            print(f"⚠️ Failed to mark skipped in sheet: {e}")
+    def _write_to_row(url, row_num=None, status_msg=None, result_data=None, contract_data=None):
+        """
+        Write to the sheet under sheet_lock.  If row_num is None, scans
+        for the next empty row fresh each time so we never collide with
+        rows added by other scripts or parallel workers.
+        """
+        if row_num is None:
+            row_num = _find_next_empty_row(wks)
+            wks.update_value(f'B{row_num}', url)
+
+        if status_msg:
+            wks.update_value(f'K{row_num}', status_msg)
+        elif result_data:
+            drive_folder_link = result_data.get("folder_link")
+            if ENABLE_DRIVE_UPLOAD and not drive_folder_link:
+                print(f"Uploading SAM.gov files to Google Drive...")
+                drive_folder_link = upload_sam_files_to_drive(url)
+
+            wks.update_value(f'I{row_num}', result_data['emails'])
+            wks.update_value(f'K{row_num}', 'generated')
+            if ENABLE_DRIVE_UPLOAD:
+                wks.update_value(f'C{row_num}', drive_folder_link or "No files uploaded")
+
+        time.sleep(1)
+        return row_num
 
     def handle_contract(contract):
         if test_done and test_done.is_set():
@@ -248,13 +326,7 @@ def process_contracts_to_sheet(contracts):
 
         print(f"\n--- Processing Contract: {url} ---")
 
-        with sheet_lock:
-            row_num, existing_record = find_link_in_sheet(wks, url)
-            if row_num and existing_record:
-                existing_status = str(existing_record.get('getEmails', '')).strip().lower()
-                if existing_status and existing_status != 'processing...':
-                    print(f"Already processed ({existing_status}) for {url}, skipping...")
-                    return
+        row_num = preloaded_rows.get(url)
 
         resource_links = contract.get('resourceLinks')
         notice_id = contract.get('noticeId')
@@ -270,44 +342,43 @@ def process_contracts_to_sheet(contracts):
         if not result_data or emails == 'skipped':
             print(f"Processing failed or was skipped for {url}")
             with sheet_lock:
-                _mark_skipped_in_sheet(url, "skipped", row_num)
+                _write_to_row(url, row_num, status_msg="skipped")
             return
         if emails == 'Not found':
             print(f"Skipping sheet: no vendor/emails found for {url}")
             with sheet_lock:
-                _mark_skipped_in_sheet(url, "no emails found", row_num)
+                _write_to_row(url, row_num, status_msg="no emails found")
             return
         if isinstance(emails, str) and emails.strip().startswith('ERROR:'):
             err_preview = emails.strip()[:80] + ('...' if len(emails) > 80 else '')
             print(f"Skipping sheet: error for {url} - {err_preview}")
             with sheet_lock:
-                _mark_skipped_in_sheet(url, f"error: {err_preview}", row_num)
+                _write_to_row(url, row_num, status_msg=f"error: {err_preview}")
             return
 
-        # Write B, C, I, K to the sheet (lead discovery data only)
         with sheet_lock:
-            success, target_row = add_or_update_sheet(wks, url, result_data, contract, row_num)
-            if not success:
-                print(f"Failed to write lead data for {url}")
+            try:
+                target_row = _write_to_row(url, row_num, result_data=result_data, contract_data=contract)
+                print(f"Wrote lead data to row {target_row} for {url}")
+            except Exception as e:
+                print(f"Failed to write lead data for {url}: {e}")
                 return
-            print(f"Wrote lead data to row {target_row} for {url}")
 
-        # Get the Drive link that was just written to column C
         with sheet_lock:
             drive_link = wks.cell(f'C{target_row}').value or ""
 
-        # Now generate subject/body, verify via Bouncer, and create draft
         if gmail_client:
+            fresh_token = get_drive_access_token()
             row_success = process_row(
                 target_row, url, drive_link, emails,
-                wks, access_token, gmail_client, sheet_lock,
+                wks, fresh_token, gmail_client, sheet_lock,
             )
             if row_success and test_done:
                 print(f"\n=== TEST MODE: First fully successful contract done. Stopping. ===")
                 test_done.set()
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        executor.map(handle_contract, contracts)
+        executor.map(handle_contract, new_contracts)
 
     print("\n=== Finished processing contracts to Google Sheets ===")
 
@@ -510,7 +581,7 @@ def main():
     print("=== Simple Government Contracts Fetcher ===\n")
     
     # Set date range (last 7 days)
-    end_date = datetime.now()- timedelta(days=1)
+    end_date = datetime.now()
     start_date = end_date - timedelta(days=1)
     posted_from = start_date.strftime('%m/%d/%Y')
     posted_to = end_date.strftime('%m/%d/%Y')

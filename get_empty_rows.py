@@ -58,12 +58,22 @@ def setup_sheet():
     return wks
 
 
+_cached_drive_token = None
+_cached_drive_token_expiry = 0
+
+
 def get_drive_access_token():
-    """Get an OAuth2 access token using the service-account key."""
+    """Get an OAuth2 access token using the service-account key.
+    Caches the token and auto-refreshes 5 minutes before expiry."""
+    global _cached_drive_token, _cached_drive_token_expiry
     import jwt, time as _time
+
+    now = int(_time.time())
+    if _cached_drive_token and now < _cached_drive_token_expiry - 300:
+        return _cached_drive_token
+
     with open("key.json", "r") as f:
         creds = json.load(f)
-    now = int(_time.time())
     payload = {
         "iss": creds["client_email"],
         "scope": "https://www.googleapis.com/auth/drive.readonly",
@@ -79,7 +89,11 @@ def get_drive_access_token():
             "assertion": token,
         },
     )
-    return resp.json()["access_token"]
+    data = resp.json()
+    _cached_drive_token = data["access_token"]
+    _cached_drive_token_expiry = now + data.get("expires_in", 3600)
+    print(f"  [Drive token] Refreshed (expires in {data.get('expires_in', 3600)}s)")
+    return _cached_drive_token
 
 
 def download_drive_files(folder_id, access_token):
