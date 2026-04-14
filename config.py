@@ -3,6 +3,20 @@ Centralized configuration for government contracts processing.
 All API keys, constants, and settings are defined here.
 """
 import os
+from pathlib import Path
+
+def _load_dotenv():
+    env_path = Path(__file__).resolve().parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            if key and _ and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
 
 # =============================================================================
 # API KEYS
