@@ -167,6 +167,40 @@ def generate_subject_body(solicitation_text):
     return subject, body
 
 
+def create_email_draft(emails_raw, subject, html_body, gmail_client):
+    """
+    Verify emails via Bouncer and create a Gmail draft.
+    Shared by federal_contracts_main, localContracts_texas, and localContracts_la.
+
+    Returns the draft dict on success, None on failure.
+    """
+    if not emails_raw or not subject or not html_body or not gmail_client:
+        return None
+
+    bcc_list = [e.strip() for e in re.split(r"[;,]", emails_raw) if e.strip()]
+    if not bcc_list:
+        return None
+
+    print(f"  Verifying {len(bcc_list)} emails via Bouncer...")
+    verified = verify_emails_batch(bcc_list)
+    if not verified:
+        print("  No deliverable emails — skipping draft.")
+        return None
+
+    print(f"  {len(verified)} deliverable emails. Creating draft...")
+    draft = gmail_client.create_draft(
+        to=NEXAN_EMAIL,
+        subject=subject,
+        html_body=html_body,
+        bcc=", ".join(verified),
+    )
+    if draft:
+        print(f"  Draft created (ID: {draft.get('id', 'N/A')})")
+    else:
+        print("  Failed to create Gmail draft.")
+    return draft
+
+
 SKIP_STATUSES = {"controlled attachments", "skipped", "no files", "site visit"}
 
 def get_empty_rows(records):
