@@ -7,7 +7,7 @@ Functions for analyzing local contract opportunities (ESBD, etc.)
 import os
 from main import fetch_ui_link_data
 from download_esbd_files import download_esbd_files, DOWNLOADS_DIR as ESBD_DOWNLOADS_DIR
-from gemini import analyze_contract_text, has_site_visit
+from gemini import analyze_contract_text, has_site_visit, is_heavy_construction
 from generateLeads import process_single_solicitation
 from backfillfolderLinks import get_drive_access_token, create_drive_folder, upload_file_to_drive
 import json
@@ -26,7 +26,7 @@ from selenium.common.exceptions import TimeoutException
 from runN8nFlows import call_LocalContractFlow, call_samGovFlow
 import re
 from list_rfq_drafts import rename_rfq_drafts
-from get_empty_rows import GmailClient, NEXAN_ACCOUNT_CONFIG, create_email_draft
+from get_empty_rows import GmailClient, NEXAN_ACCOUNT_CONFIG, create_email_draft, generate_subject_body
 
 # Import from centralized config and services
 from config import DRIVE_PARENT_FOLDER_ID, EAST_TX_COUNTIES, OPENAI_API_KEY
@@ -380,25 +380,32 @@ def can_apply_without_registration(esbd_url, generate_leads=True):
             # East TX contracts are captured even when skipped)
             county = classify_county(complete_text)
 
-            # Check for mandatory site visit, controlled attachments, in-person submission, and missing bid docs
-            print("Checking filters: site visit, controlled attachments, in-person submission, missing bid docs...")
+            # Check for heavy construction first — we skip heavy construction contracts
+            print("Checking filter: heavy construction...")
+            heavy_construction_result = is_heavy_construction(complete_text)
+            print(f"  Heavy construction detected: {heavy_construction_result['is_heavy_construction']}")
+            print(f"  Reasoning: {heavy_construction_result['reasoning']}")
+            if heavy_construction_result["is_heavy_construction"]:
+                print("Skipping: Contract is heavy construction.")
+                return {
+                    "can_apply": False,
+                    "status": "Heavy Construction",
+                    "reasoning": heavy_construction_result['reasoning'],
+                    "attachment_url": attachment_url,
+                    "lead_generation": None,
+                    "county": county,
+                }
+
+            # Check for controlled attachments, in-person submission, and missing bid docs.
+            # Site visits are allowed and are NOT a reason to skip.
+            print("Checking filters: controlled attachments, in-person submission, missing bid docs...")
             site_visit_result = has_site_visit(complete_text, check_in_person_submission=True)
-            print(f"  Site visit detected: {site_visit_result['has_site_visit']}")
+            print(f"  Site visit detected: {site_visit_result['has_site_visit']} (informational only — no longer skipped)")
             print(f"  Controlled attachments detected: {site_visit_result['has_controlled_attachments']}")
             print(f"  In-person submission only: {site_visit_result.get('requires_in_person_submission', False)}")
             print(f"  Missing bid documents: {site_visit_result.get('missing_bid_documents', False)}")
             print(f"  External documents URL: {site_visit_result.get('external_documents_url', None)}")
             print(f"  Reasoning: {site_visit_result['reasoning']}")
-            if site_visit_result["has_site_visit"]:
-                print("Skipping: Contract has a site visit/pre-proposal conference.")
-                return {
-                    "can_apply": False,
-                    "status": "Site Visit Required",
-                    "reasoning": site_visit_result['reasoning'],
-                    "attachment_url": attachment_url,
-                    "lead_generation": None,
-                    "county": county,
-                }
             if site_visit_result["has_controlled_attachments"]:
                 print("Skipping: Contract has controlled (non-public) attachments.")
                 return {
@@ -470,7 +477,7 @@ def can_apply_without_registration(esbd_url, generate_leads=True):
                         "county": county,
                     }
 
-            # Generate leads using OpenAI
+            # Generate leads using OpenAI (emails only — subject/body come from Gemini downstream)
             lead_generation = process_esbd_text_with_openai(esbd_url, complete_text)
         
         result = {
@@ -478,6 +485,7 @@ def can_apply_without_registration(esbd_url, generate_leads=True):
             "reasoning": reasoning,
             "attachment_url": attachment_url,
             "lead_generation": lead_generation,
+            "complete_text": complete_text if 'complete_text' in dir() else "",
             "county": county if 'county' in dir() else "Unknown",
         }
         # If we downloaded files from Bonfire, pass them for Drive upload
@@ -789,9 +797,20 @@ def processEsbdSolicitations(records, sh, spreadsheet):
             if result['can_apply']:
                 if 'lead_generation' in result and 'error' not in result['lead_generation']:
                     lead_gen = result['lead_generation']
-                    if "subject" in lead_gen:
-                        lead_gen['subject'] = lead_gen['subject'] + "- texasLocal"
                     reasoning = result.get('reasoning', 'Can apply without additional registration')
+
+                    # Federal-style flow: OpenAI gave us emails; now use Gemini
+                    # to generate the subject and body from the same solicitation text.
+                    complete_text = result.get('complete_text', '') or ''
+                    gemini_subject, gemini_body = (None, None)
+                    if complete_text.strip():
+                        print(f"🤖 Generating subject/body with Gemini (federal-style)...")
+                        gemini_subject, gemini_body = generate_subject_body(complete_text)
+                    if not gemini_subject or not gemini_body:
+                        print(f"⚠️ Gemini subject/body generation failed — draft will be skipped.")
+
+                    final_subject = (gemini_subject + " - texasLocal") if gemini_subject else "Not found"
+                    final_body = gemini_body if gemini_body else "Not found"
 
                     print(f"📤 Uploading files to Google Drive...")
                     if result.get("bonfire_files"):
@@ -810,27 +829,30 @@ def processEsbdSolicitations(records, sh, spreadsheet):
                             due_date=due_date,
                             status="Can Apply - Leads Generated",
                             reasoning=reasoning,
-                            subject=lead_gen.get('subject', 'Not found'),
-                            body=lead_gen.get('body', 'Not found'),
+                            subject=final_subject,
+                            body=final_body,
                             emails=lead_gen.get('emails', 'Not found'),
                             folder_link=drive_folder_link,
                             target_row=lc_row
                         )
                     print(f"✅ Row {row}: Added to localContracts (row {target_row})")
 
-                    create_email_draft(
-                        lead_gen.get('emails', ''),
-                        lead_gen.get('subject', ''),
-                        lead_gen.get('body', ''),
-                        gmail_client,
-                    )
+                    if gemini_subject and gemini_body:
+                        create_email_draft(
+                            lead_gen.get('emails', ''),
+                            final_subject,
+                            final_body,
+                            gmail_client,
+                        )
+                    else:
+                        print(f"⏭️ Row {row}: Skipping Gmail draft (no subject/body from Gemini).")
 
                     results.append({
                         'esbd_url': esbd_url,
                         'can_apply': True,
                         'emails': lead_gen.get('emails', 'Not found'),
-                        'subject': lead_gen.get('subject', 'Not found'),
-                        'body': lead_gen.get('body', 'Not found')
+                        'subject': final_subject,
+                        'body': final_body
                     })
 
                     print(f"✅ Row {row}: Success - leads generated and added to localContracts")

@@ -6,62 +6,23 @@ import re
 import time
 from datetime import datetime
 
-# Gemini API Configuration
-# Multiple API keys from different Google Cloud projects
-
-GEMINI_API_KEYS = [k.strip() for k in os.getenv('GEMINI_API_KEYS', '').split(',') if k.strip()]
-
-# Old API keys (kept for reference)
-# GEMINI_API_KEYS = [
-#     "AIzaSyA05v1DtlGfVSkhkfyFOULoNYksSHm-fWw",
-#     "AIzaSyAnA4U9EN63VhKr0AY-JWW0RWr_ZJoQRHE",
-#     "AIzaSyB1gsVVKyUj3WGUCpuwkLRds10xyqM0Bmg",
-#     "AIzaSyAcLEp4GZu00-ARY4s8CSqUYiAgst-fCEg",
-#     "AIzaSyDYDqeef4y4FKXOnqlapjkfIwh2kICEfwA",
-#     "AIzaSyB47JkWxTgFg_6hUtMAGRJkOOWqB3UgWyI",
-#     "AIzaSyCacYEgC1OKS05FG0SLn0bLE9C-LDOLHw8",
-#     "AIzaSyDKRW9tPPfYt64uK5zEhYNPMgXZbsUs8VY",
-#     "AIzaSyDlRAIBbzEF8cDCwDX4qQoNgEMTDnYSr-4",
-#     "AIzaSyCGkKH3sAPUMYgYiSPkSbv9sBAh_0NPQPM",
-# ]
+from config import GEMINI_API_KEYS
 
 # Current key index for rotation
 current_key_index = 0
 
 # Track usage per key (for monitoring)
-key_usage = {}
-
-def load_api_keys_from_file(filename="api_keys.txt"):
-    """Load API keys from a text file (one key per line)."""
-    global GEMINI_API_KEYS
-    try:
-        with open(filename, 'r') as f:
-            keys = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-            if keys:
-                GEMINI_API_KEYS = keys
-                print(f"Loaded {len(keys)} API keys from {filename}")
-                initialize_usage_tracking()
-            else:
-                print(f"No valid API keys found in {filename}")
-    except FileNotFoundError:
-        print(f"API keys file {filename} not found. Using default configuration.")
-
-def initialize_usage_tracking():
-    """Initialize usage tracking for all API keys."""
-    global key_usage
-    key_usage = {i: 0 for i in range(len(GEMINI_API_KEYS))}
+key_usage = {i: 0 for i in range(len(GEMINI_API_KEYS))}
 
 def get_current_api_key():
     """Get the current API key, track usage, and rotate proactively for even distribution."""
     global current_key_index, key_usage
     key = GEMINI_API_KEYS[current_key_index]
     
-    # Track usage
     if current_key_index not in key_usage:
         key_usage[current_key_index] = 0
     key_usage[current_key_index] += 1
     
-    # Proactive round-robin: rotate after every call so requests spread evenly
     current_key_index = (current_key_index + 1) % len(GEMINI_API_KEYS)
     
     return key
@@ -71,29 +32,6 @@ def rotate_api_key():
     global current_key_index
     current_key_index = (current_key_index + 1) % len(GEMINI_API_KEYS)
     print(f"Rotated to API key {current_key_index + 1}/{len(GEMINI_API_KEYS)}")
-
-def get_usage_stats():
-    """Get usage statistics for all API keys."""
-    total_usage = sum(key_usage.values())
-    print(f"\nAPI Key Usage Statistics:")
-    print(f"Total requests made: {total_usage}")
-    for i, usage in key_usage.items():
-        percentage = (usage / total_usage * 100) if total_usage > 0 else 0
-        print(f"Key {i+1}: {usage} requests ({percentage:.1f}%)")
-    print()
-
-def add_api_key(new_key):
-    """Add a new API key to the rotation."""
-    global GEMINI_API_KEYS, key_usage
-    GEMINI_API_KEYS.append(new_key)
-    key_usage[len(GEMINI_API_KEYS) - 1] = 0
-    print(f"Added new API key. Total keys: {len(GEMINI_API_KEYS)}")
-
-# Initialize usage tracking
-initialize_usage_tracking()
-
-# Try to load keys from file on startup
-load_api_keys_from_file()
 
 MODEL = "gemini-3-flash-preview"  # Official model name
 TEMPERATURE = 0.3
@@ -1613,6 +1551,247 @@ Return ONLY a JSON object with this exact structure:
             }
         except (json.JSONDecodeError, KeyError) as e:
             print(f"Failed to parse construction check response: {e}")
+            default_result["reasoning"] = f"Parse error: {e}"
+            return default_result
+
+    default_result["reasoning"] = "All API attempts exhausted (Gemini + OpenAI fallback)"
+    return default_result
+
+
+def is_heavy_construction(solicitation_text, max_retries=3):
+    """
+    Determines if a solicitation is a HEAVY CONSTRUCTION contract (civil/infrastructure
+    or major structural work) that should be skipped. Light / trade work (e.g. minor
+    repairs, painting, small electrical/plumbing tasks, interior finishes) is NOT heavy
+    construction and should not be skipped by this filter.
+
+    Args:
+        solicitation_text (str): Combined text from the detail page and downloaded files
+        max_retries (int): Maximum number of API key rotations to try
+
+    Returns:
+        dict: {
+            "is_heavy_construction": bool,
+            "reasoning": str
+        }
+    """
+    default_result = {
+        "is_heavy_construction": False,
+        "reasoning": ""
+    }
+
+    if not GEMINI_API_KEYS:
+        default_result["reasoning"] = "No API keys configured, defaulting to not skip"
+        return default_result
+
+    if not solicitation_text or len(solicitation_text.strip()) < 50:
+        default_result["reasoning"] = "Insufficient text to analyze"
+        return default_result
+
+    HEAVY_CONSTRUCTION_PROMPT = """
+You are an expert in government procurement classification. Analyze the following
+solicitation and determine whether it is a HEAVY CONSTRUCTION contract.
+
+**HEAVY CONSTRUCTION** = large-scale civil, structural, or infrastructure construction
+that typically requires construction crews, heavy equipment, and substantial site work.
+Mark TRUE if the primary scope includes any of the following:
+- New building construction, major structural additions, or full building renovations
+- Road, highway, bridge, or rail construction or reconstruction
+- Heavy civil / infrastructure work (water mains, sewer systems, utilities installation,
+  stormwater systems, dams, levees, wastewater treatment plants)
+- Site preparation at scale: excavation, grading, earthwork, demolition of structures
+- Paving, asphalt, or concrete work at roadway / parking-lot scale
+- Airport runway / taxiway, port, or marine construction
+- Large-scale roofing replacement on commercial / institutional buildings
+
+**NOT heavy construction** (mark FALSE) includes:
+- Goods, supplies, equipment, IT, professional services, consulting
+- Routine maintenance, janitorial, landscaping, pest control
+- Minor repairs, small handyman work, small painting jobs, interior finish work
+- Small trade work (single fixture plumbing, a few electrical outlets, HVAC service)
+- Studies, designs, or engineering services that do not themselves perform construction
+
+Return ONLY a JSON object with this exact structure:
+{
+    "is_heavy_construction": true/false,
+    "reasoning": "Brief explanation"
+}
+"""
+
+    max_content_chars = 100000
+    truncated_text = solicitation_text[:max_content_chars] if len(solicitation_text) > max_content_chars else solicitation_text
+
+    full_prompt = f"{HEAVY_CONSTRUCTION_PROMPT}\n\nSOLICITATION TEXT TO ANALYZE:\n\n{truncated_text}"
+
+    result_text = call_llm(full_prompt, temperature=0.1,
+                           response_mime_type="application/json", max_retries=max_retries)
+    if result_text:
+        try:
+            parsed = json.loads(result_text)
+            return {
+                "is_heavy_construction": bool(parsed.get("is_heavy_construction", False)),
+                "reasoning": parsed.get("reasoning", "")
+            }
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Failed to parse heavy-construction response: {e}")
+            default_result["reasoning"] = f"Parse error: {e}"
+            return default_result
+
+    default_result["reasoning"] = "All API attempts exhausted (Gemini + OpenAI fallback)"
+    return default_result
+
+
+def classify_premium_contract_opportunity(solicitation_text, max_retries=3):
+    """
+    Classify whether a solicitation should use the premium lead-generation model.
+
+    This is a routing helper only. It does not skip contracts; callers can use
+    should_use_premium_model to decide whether to use the more expensive Gemini
+    vendor-lead flow or the existing standard flow.
+
+    Premium triggers:
+    - Multi-year contract structure
+    - Equipment rental / lease opportunity
+
+    Returns:
+        dict: {
+            "is_multi_year": bool,
+            "is_equipment_rental": bool,
+            "should_use_premium_model": bool,
+            "confidence": "high" | "medium" | "low",
+            "estimated_duration": str | None,
+            "rental_equipment": list[str],
+            "evidence": list[str],
+            "reasoning": str
+        }
+    """
+    default_result = {
+        "is_multi_year": False,
+        "is_equipment_rental": False,
+        "should_use_premium_model": False,
+        "confidence": "low",
+        "estimated_duration": None,
+        "rental_equipment": [],
+        "evidence": [],
+        "reasoning": ""
+    }
+
+    if not solicitation_text or len(solicitation_text.strip()) < 50:
+        default_result["reasoning"] = "Insufficient text to analyze"
+        return default_result
+
+    PREMIUM_CLASSIFIER_PROMPT = """
+You are an expert in government procurement classification. Analyze the
+solicitation and determine whether it should be routed to a premium, more
+expensive vendor-lead generation model.
+
+This is NOT a skip filter. Contracts that are not premium should still be
+processed by the normal model.
+
+Premium routing should be TRUE if EITHER of these conditions is true:
+
+1. MULTI-YEAR CONTRACT
+Mark is_multi_year TRUE when the solicitation indicates recurring or long-term
+contract value across more than 12 months, including:
+- A base period plus one or more option years or option periods
+- Multiple annual renewal periods
+- A period of performance longer than 12 months
+- IDIQ, BPA, blanket purchase, or task-order vehicles with an ordering period
+  longer than 12 months
+- Explicit language such as "multi-year", "five-year contract", "base year",
+  "option year", "renewal term", or similar
+
+Do NOT mark multi-year true for:
+- A one-time purchase with delivery in a future calendar year
+- Fiscal year references only
+- Warranty periods, maintenance warranty, or support warranty only
+- Proposal validity periods
+- Funding availability across fiscal years without a multi-year performance or
+  ordering period
+- Ambiguous schedules where no period longer than 12 months is supported
+
+2. EQUIPMENT RENTAL OR LEASE
+Mark is_equipment_rental TRUE when the government is seeking to rent or lease
+equipment from a vendor, including:
+- Rental, lease, leased equipment, equipment rental service, rent-to-own
+- Weekly, monthly, annual, or temporary rental of equipment
+- Vendor-provided equipment that remains vendor-owned during performance
+- Common rental categories such as portable toilets, dumpsters, roll-off
+  containers, storage containers, office trailers, generators, lifts,
+  forklifts, pumps, vehicles, trailers, tents, HVAC units, or similar equipment
+
+Do NOT mark equipment rental true for:
+- Buying or procuring equipment outright
+- Replacement parts or repair services for equipment
+- Contractor using its own tools to perform a service when the government is
+  not renting/leasing those tools
+- Facility leases or real-estate leases that are not equipment
+
+Confidence guidance:
+- high: explicit contract language supports the classification
+- medium: strongly implied by schedule/pricing/unit language
+- low: weak or ambiguous evidence
+
+Return ONLY a JSON object with this exact structure:
+{
+    "is_multi_year": true/false,
+    "is_equipment_rental": true/false,
+    "confidence": "high" | "medium" | "low",
+    "estimated_duration": "string or null",
+    "rental_equipment": ["equipment names if any"],
+    "evidence": ["short exact phrases or close paraphrases from the solicitation"],
+    "reasoning": "Brief explanation"
+}
+"""
+
+    max_content_chars = 900000
+    truncated_text = solicitation_text[:max_content_chars] if len(solicitation_text) > max_content_chars else solicitation_text
+    full_prompt = f"{PREMIUM_CLASSIFIER_PROMPT}\n\nSOLICITATION TEXT TO ANALYZE:\n\n{truncated_text}"
+
+    if GEMINI_API_KEYS:
+        result_text = call_llm(full_prompt, temperature=0.1,
+                               response_mime_type="application/json", max_retries=max_retries)
+    else:
+        print("No Gemini API keys configured. Using OpenAI fallback for premium classifier...")
+        result_text = _call_openai_fallback(full_prompt, temperature=0.1)
+
+    if result_text:
+        try:
+            try:
+                parsed = json.loads(result_text)
+            except json.JSONDecodeError:
+                start = result_text.find("{")
+                end = result_text.rfind("}")
+                if start == -1 or end == -1 or end <= start:
+                    raise
+                parsed = json.loads(result_text[start:end + 1])
+
+            is_multi_year = bool(parsed.get("is_multi_year", False))
+            is_equipment_rental = bool(parsed.get("is_equipment_rental", False))
+            confidence = str(parsed.get("confidence", "low")).strip().lower()
+            if confidence not in {"high", "medium", "low"}:
+                confidence = "low"
+
+            rental_equipment = parsed.get("rental_equipment", [])
+            if not isinstance(rental_equipment, list):
+                rental_equipment = []
+
+            evidence = parsed.get("evidence", [])
+            if not isinstance(evidence, list):
+                evidence = []
+
+            return {
+                "is_multi_year": is_multi_year,
+                "is_equipment_rental": is_equipment_rental,
+                "should_use_premium_model": is_multi_year or is_equipment_rental,
+                "confidence": confidence,
+                "estimated_duration": parsed.get("estimated_duration"),
+                "rental_equipment": rental_equipment,
+                "evidence": evidence,
+                "reasoning": parsed.get("reasoning", "")
+            }
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Failed to parse premium classifier response: {e}")
             default_result["reasoning"] = f"Parse error: {e}"
             return default_result
 

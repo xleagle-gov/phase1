@@ -41,10 +41,10 @@ from urllib.parse import urljoin, quote
 from localContracts_texas import add_row_to_local_contracts, add_row_to_skipped_contracts
 from services.openai_service import generate_vendor_leads
 from google_drive_utils import extract_text_from_file_content
-from gemini import has_site_visit
+from gemini import has_site_visit, is_heavy_construction
 from backfillfolderLinks import get_drive_access_token, create_drive_folder, upload_file_to_drive
 from config import DRIVE_PARENT_FOLDER_ID
-from get_empty_rows import GmailClient, NEXAN_ACCOUNT_CONFIG, create_email_draft
+from get_empty_rows import GmailClient, NEXAN_ACCOUNT_CONFIG, create_email_draft, generate_subject_body
 import json
 
 LA_BASE_URL = "https://wwwcfprd.doa.louisiana.gov"
@@ -118,7 +118,7 @@ def load_all_progress():
         return {}
 
 
-def save_solicitation_cache(sol_id, page_text, files_text, filter_result, lead_result=None):
+def save_solicitation_cache(sol_id, page_text, files_text, filter_result, lead_result=None, heavy_construction_result=None):
     _ensure_cache_dir()
     sol_cache_dir = os.path.join(LA_CACHE_DIR, "solicitations")
     os.makedirs(sol_cache_dir, exist_ok=True)
@@ -128,6 +128,7 @@ def save_solicitation_cache(sol_id, page_text, files_text, filter_result, lead_r
         "page_text_len": len(page_text),
         "files_text_len": len(files_text),
         "filter_result": filter_result,
+        "heavy_construction_result": heavy_construction_result,
         "lead_result": lead_result,
     }
     text_dir = os.path.join(sol_cache_dir, re.sub(r"[^\w\-]", "_", sol_id))
@@ -720,6 +721,7 @@ def process_la_solicitations(
             page_text = ""
             files_text = ""
             site_visit_result = None
+            heavy_construction_result = None
             download_dir = ""
 
             if sol_cache and sol_cache.get("filter_result"):
@@ -727,6 +729,7 @@ def process_la_solicitations(
                 page_text = sol_cache.get("page_text", "")
                 files_text = sol_cache.get("files_text", "")
                 site_visit_result = sol_cache["filter_result"]
+                heavy_construction_result = sol_cache.get("heavy_construction_result")
                 safe_id = re.sub(r"[^\w\-]", "_", bid_number)
                 download_dir = os.path.abspath(os.path.join(LA_DOWNLOADS_DIR, safe_id))
             else:
@@ -745,21 +748,39 @@ def process_la_solicitations(
                 else:
                     print("  No files downloaded, using page text only")
 
-                print("  Checking filters: site visit, controlled attachments, in-person submission, missing bid docs...")
+                print("  Checking filters: heavy construction, controlled attachments, in-person submission, missing bid docs...")
                 check_text = f"{page_text}\n\n{files_text}"
                 site_visit_result = has_site_visit(check_text, check_in_person_submission=True)
+                heavy_construction_result = is_heavy_construction(check_text)
 
-                save_solicitation_cache(bid_number, page_text, files_text, site_visit_result)
+                save_solicitation_cache(
+                    bid_number, page_text, files_text, site_visit_result,
+                    heavy_construction_result=heavy_construction_result,
+                )
 
-            print(f"    Site visit: {site_visit_result['has_site_visit']}")
+            # Backfill heavy-construction result on older caches that don't have it yet.
+            if heavy_construction_result is None:
+                print("  Heavy-construction result missing from cache; computing now...")
+                check_text = f"{page_text}\n\n{files_text}"
+                heavy_construction_result = is_heavy_construction(check_text)
+                save_solicitation_cache(
+                    bid_number, page_text, files_text, site_visit_result,
+                    lead_result=(sol_cache or {}).get("lead_result"),
+                    heavy_construction_result=heavy_construction_result,
+                )
+
+            print(f"    Heavy construction: {heavy_construction_result.get('is_heavy_construction', False)}")
+            print(f"    Site visit: {site_visit_result['has_site_visit']} (informational only — no longer skipped)")
             print(f"    Controlled attachments: {site_visit_result['has_controlled_attachments']}")
             print(f"    In-person submission: {site_visit_result.get('requires_in_person_submission', False)}")
             print(f"    Missing bid documents: {site_visit_result.get('missing_bid_documents', False)}")
             print(f"    Reasoning: {site_visit_result['reasoning']}")
 
             skip_status = None
-            if site_visit_result["has_site_visit"]:
-                skip_status = "Site Visit Required"
+            skip_reasoning = site_visit_result.get("reasoning", "")
+            if heavy_construction_result.get("is_heavy_construction", False):
+                skip_status = "Heavy Construction"
+                skip_reasoning = heavy_construction_result.get("reasoning", "")
             elif site_visit_result["has_controlled_attachments"]:
                 skip_status = "Controlled Attachments"
             elif site_visit_result.get("requires_in_person_submission", False):
@@ -769,14 +790,14 @@ def process_la_solicitations(
                 skip_status = f"Bid Docs External: {ext_url}"
 
             if skip_status:
-                print(f"  SKIP: {skip_status} - {site_visit_result['reasoning'][:100]}")
+                print(f"  SKIP: {skip_status} - {skip_reasoning[:100]}")
                 save_progress(bid_number, "skipped_filtered", {"reason": skip_status})
                 if skipped_wks:
                     try:
                         add_row_to_skipped_contracts(
                             skipped_wks, description, solicitation_url or bid_number,
                             bid_open_date, skip_status,
-                            site_visit_result["reasoning"],
+                            skip_reasoning,
                             solicitation_url,
                         )
                     except Exception as e:
@@ -791,7 +812,10 @@ def process_la_solicitations(
                 print("  Processing with OpenAI...")
                 lead_result = process_la_with_openai(bid_number, page_text, files_text)
 
-                save_solicitation_cache(bid_number, page_text, files_text, site_visit_result, lead_result)
+                save_solicitation_cache(
+                    bid_number, page_text, files_text, site_visit_result, lead_result,
+                    heavy_construction_result=heavy_construction_result,
+                )
 
             if "ERROR" in str(lead_result.get("emails", "")):
                 print(f"  FAILED: OpenAI error - {lead_result.get('emails', '')[:100]}")
@@ -811,15 +835,32 @@ def process_la_solicitations(
 
             print("  OpenAI processing successful!")
 
+            # Federal-style flow: OpenAI provided emails; now use Gemini to
+            # generate the subject and body from the same solicitation text.
+            complete_text = f"""
+LOUISIANA LaPAC SOLICITATION:
+Bid Number: {bid_number}
+
+{page_text}
+
+DOWNLOADED FILES CONTENT:
+{files_text}
+"""
+            gemini_subject, gemini_body = (None, None)
+            if complete_text.strip():
+                print("  Generating subject/body with Gemini (federal-style)...")
+                gemini_subject, gemini_body = generate_subject_body(complete_text)
+            if not gemini_subject or not gemini_body:
+                print("  Gemini subject/body generation failed — draft will be skipped.")
+
+            final_subject = (gemini_subject + " - laLocal") if gemini_subject else "Not found"
+            final_body = gemini_body if gemini_body else "Not found"
+
             print("  Uploading files to Google Drive...")
             drive_folder_link = upload_la_files_to_drive(bid_number, download_dir)
 
             if local_contracts_wks:
                 try:
-                    subject = lead_result.get("subject", "Not found")
-                    if subject and subject != "Not found":
-                        subject = subject + " - laLocal"
-
                     reasoning = (
                         f"LA LaPAC | Bid#: {bid_number} | "
                         f"Issued: {sol.get('date_issued', 'N/A')} | "
@@ -833,8 +874,8 @@ def process_la_solicitations(
                         due_date=bid_open_date,
                         status="LA Local - Leads Generated",
                         reasoning=reasoning,
-                        subject=subject,
-                        body=lead_result.get("body", "Not found"),
+                        subject=final_subject,
+                        body=final_body,
                         emails=lead_result.get("emails", "Not found"),
                         folder_link=drive_folder_link,
                     )
@@ -844,12 +885,15 @@ def process_la_solicitations(
                     existing_ids.add(solicitation_url)
                     save_progress(bid_number, "added_to_sheets", {"row": target_row})
 
-                    create_email_draft(
-                        lead_result.get('emails', ''),
-                        subject,
-                        lead_result.get('body', ''),
-                        gmail_client,
-                    )
+                    if gemini_subject and gemini_body:
+                        create_email_draft(
+                            lead_result.get('emails', ''),
+                            final_subject,
+                            final_body,
+                            gmail_client,
+                        )
+                    else:
+                        print("  Skipping Gmail draft (no subject/body from Gemini).")
 
                 except Exception as e:
                     print(f"  Error adding to Google Sheets: {e}")

@@ -114,6 +114,10 @@ def download_drive_files(folder_id, access_token):
         return {}
 
     print(f"  Found {len(files)} file(s) in Drive folder.")
+    if len(files) > 10:
+        print(f"  ⏭️ Skipping download: {len(files)} files exceeds 10-file limit")
+        return None
+
     downloaded = {}
     for f in files:
         print(f"    Downloading {f['name']}...")
@@ -290,6 +294,11 @@ def process_row(row_num, sam_link, drive_link, emails_raw, wks, access_token, gm
         return False
 
     downloaded = download_drive_files(folder_id, access_token)
+    if downloaded is None:
+        print(f"  [Row {row_num}] Too many files — skipping.")
+        with sheet_lock:
+            wks.update_value(f"K{row_num}", "skipped: too many files")
+        return False
     if not downloaded:
         print(f"  [Row {row_num}] No files downloaded — skipping.")
         with sheet_lock:

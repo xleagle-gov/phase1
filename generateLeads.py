@@ -116,6 +116,56 @@ def save_cached_skip(url, skip_reason):
     except Exception as e:
         print(f"Error saving skip cache: {e}")
 
+
+def get_drive_cache_filename(url):
+    """Generate a Drive-folder-link cache filename based on the URL."""
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    return f"sam_drive_{url_hash}.json"
+
+
+def load_cached_drive_link(url):
+    """Return the cached Google Drive folder link for a URL, or None.
+
+    No TTL: a Drive folder, once created, is expected to live indefinitely.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_file = os.path.join(CACHE_DIR, get_drive_cache_filename(url))
+
+    if not os.path.exists(cache_file):
+        return None
+
+    try:
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            cache_data = json.load(f)
+        link = cache_data.get('folder_link')
+        if link:
+            print(f"SUCCESS: Loaded cached Drive link: {link}")
+        return link
+    except Exception as e:
+        print(f"Error loading Drive link cache: {e}")
+        return None
+
+
+def save_cached_drive_link(url, folder_link):
+    """Persist the Google Drive folder link so future runs skip re-upload."""
+    if not folder_link:
+        return
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_file = os.path.join(CACHE_DIR, get_drive_cache_filename(url))
+
+    cache_data = {
+        'url': url,
+        'folder_link': folder_link,
+        'timestamp': datetime.now().isoformat(),
+    }
+
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        print(f"Saved Drive link to cache: {folder_link}")
+    except Exception as e:
+        print(f"Error saving Drive link cache: {e}")
+
 def upload_sam_files_to_drive(url):
     """
     Upload downloaded SAM.gov files to Google Drive and return the folder link.
@@ -185,7 +235,12 @@ def upload_sam_files_to_drive(url):
         
         print(f"✅ Uploaded {uploaded_count}/{len(files_to_upload)} files to Google Drive")
         print(f"📎 Folder link: {folder_link}")
-        
+
+        # Persist so reruns (where text is served from cache and no files are
+        # on disk) can reuse the link instead of re-uploading or writing the
+        # sentinel "No files uploaded" into the sheet.
+        save_cached_drive_link(url, folder_link)
+
         return folder_link
         
     except Exception as e:
@@ -224,7 +279,7 @@ def process_single_solicitation(url, resource_links=None, notice_id=None):
     # Step 1: Try to load cached text first
     print("Step 1: Checking for cached text...")
     complete_text = load_cached_text(url)
-    
+
     if not complete_text:
         # Step 1a: Get all extracted text from SAM.gov (UI text + all attachment files)
         print("Step 1a: No cache found, extracting all text from SAM.gov...")
@@ -257,7 +312,21 @@ def process_single_solicitation(url, resource_links=None, notice_id=None):
         save_cached_text(url, complete_text)
     else:
         print("Using cached text (skipping download and extraction)")
-        folder_link_for_sheet = None
+        # Prefer a previously-cached Drive folder link so the caller can skip
+        # re-uploading. If there isn't one and Drive upload is enabled, we
+        # must re-materialize the files on disk, otherwise the caller's
+        # upload_sam_files_to_drive() will find an empty directory and write
+        # the "No files uploaded" sentinel into the sheet, which blocks draft
+        # creation downstream (process_row can't extract a /folders/ id).
+        folder_link_for_sheet = load_cached_drive_link(url)
+        if not folder_link_for_sheet and ENABLE_DRIVE_UPLOAD:
+            print("No cached Drive link found; re-downloading SAM.gov files so upload can proceed...")
+            try:
+                download_files_from_sam_url(
+                    url, resource_links=resource_links, notice_id=notice_id
+                )
+            except Exception as e:
+                print(f"Re-download failed (non-fatal, upload may be skipped): {e}")
     
     # Step 2: Generate vendor leads using centralized OpenAI service
     print("Step 2: Generating vendor leads using OpenAI service...")

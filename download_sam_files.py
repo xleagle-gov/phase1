@@ -13,6 +13,7 @@ import os
 import json
 import requests
 import re
+import shutil
 from datetime import datetime
 from main import fetch_contracts, fetch_ui_link_data
 from google_drive_utils import extract_text_from_file_content, get_filename_from_cd
@@ -1078,14 +1079,159 @@ def cleanup_old_downloads(keep_notice_ids=None):
                         sub_path = os.path.join(extracted_path, sub_item)
                         if os.path.isdir(sub_path):
                             print(f"Removing old extracted directory: {sub_path}")
-                            import shutil
                             shutil.rmtree(sub_path)
             continue
         
         # Remove old notice directories
         print(f"Removing old download directory: {item_path}")
-        import shutil
         shutil.rmtree(item_path)
+
+
+# Directory where the PIEE fallback writes debug HTML/screenshots per notice.
+# Kept here so cleanup_notice_downloads / cleanup_all_downloads can sweep it
+# alongside the SAM.gov download directories.
+PIEE_DEBUG_DIR = 'piee_debug'
+
+
+def _dir_size_bytes(path):
+    """Return the total size in bytes of a directory tree (best-effort)."""
+    total = 0
+    try:
+        for root, _, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return total
+
+
+def cleanup_notice_downloads(notice_id):
+    """Delete all local artifacts tied to a single notice.
+
+    Safe to call from any worker thread because each notice_id is unique and
+    the three target paths are disjoint across notices.
+
+    Paths removed (when they exist):
+      - downloaded_files/<notice_id>/            (raw SAM.gov downloads)
+      - downloaded_files/extracted/<notice_id>/  (extracted ZIP contents)
+      - piee_debug/<notice_id>/                  (PIEE Selenium debug snapshots)
+
+    Per-notice text caches (cache/, text_cache/, extracted_text/) are left
+    intact: they are small and speed up re-runs of the same notice.
+
+    Returns the number of bytes freed.
+    """
+    if not notice_id:
+        return 0
+
+    paths_to_remove = [
+        os.path.join(DOWNLOADS_DIR, notice_id),
+        os.path.join(DOWNLOADS_DIR, 'extracted', notice_id),
+        os.path.join(PIEE_DEBUG_DIR, notice_id),
+    ]
+
+    bytes_freed = 0
+    removed_any = False
+    for path in paths_to_remove:
+        if not os.path.isdir(path):
+            continue
+        size = _dir_size_bytes(path)
+        try:
+            shutil.rmtree(path)
+            bytes_freed += size
+            removed_any = True
+            print(f"🧹 Cleaned up {path} ({size:,} bytes)")
+        except Exception as e:
+            print(f"⚠️  Failed to clean {path}: {e}")
+
+    if not removed_any:
+        print(f"🧹 No local files to clean for notice {notice_id}")
+
+    return bytes_freed
+
+
+def cleanup_all_downloads():
+    """Remove every locally-cached download under downloaded_files/ and piee_debug/.
+
+    Intended for manual invocation when reclaiming disk space from the
+    historical backlog: any files listed here should already have been
+    uploaded to Google Drive by earlier runs.
+
+    This does NOT touch the small per-notice text caches (cache/, text_cache/,
+    extracted_text/) because they make re-runs much faster and their total
+    footprint is tiny compared to the raw downloads.
+
+    Returns a summary dict with counts, bytes freed, and any per-path errors.
+    """
+    summary = {
+        'notice_dirs_removed': 0,
+        'extracted_dirs_removed': 0,
+        'piee_debug_dirs_removed': 0,
+        'bytes_freed': 0,
+        'errors': [],
+    }
+
+    def _sweep(parent_dir, key):
+        """Delete every subdirectory under parent_dir; return bytes freed."""
+        if not os.path.exists(parent_dir):
+            return
+        for item in os.listdir(parent_dir):
+            item_path = os.path.join(parent_dir, item)
+            if not os.path.isdir(item_path):
+                continue
+            size = _dir_size_bytes(item_path)
+            try:
+                shutil.rmtree(item_path)
+                summary[key] += 1
+                summary['bytes_freed'] += size
+                print(f"🧹 Removed {item_path} ({size:,} bytes)")
+            except Exception as e:
+                summary['errors'].append(f"{item_path}: {e}")
+                print(f"⚠️  Failed to remove {item_path}: {e}")
+
+    # 1) downloaded_files/<notice_id>/  — skip the 'extracted' container itself,
+    #    it's handled by the second sweep.
+    if os.path.exists(DOWNLOADS_DIR):
+        for item in os.listdir(DOWNLOADS_DIR):
+            item_path = os.path.join(DOWNLOADS_DIR, item)
+            if not os.path.isdir(item_path):
+                continue
+            if item == 'extracted':
+                continue
+            size = _dir_size_bytes(item_path)
+            try:
+                shutil.rmtree(item_path)
+                summary['notice_dirs_removed'] += 1
+                summary['bytes_freed'] += size
+                print(f"🧹 Removed {item_path} ({size:,} bytes)")
+            except Exception as e:
+                summary['errors'].append(f"{item_path}: {e}")
+                print(f"⚠️  Failed to remove {item_path}: {e}")
+
+    # 2) downloaded_files/extracted/<notice_id>/
+    _sweep(os.path.join(DOWNLOADS_DIR, 'extracted'), 'extracted_dirs_removed')
+
+    # 3) piee_debug/<notice_id>/
+    _sweep(PIEE_DEBUG_DIR, 'piee_debug_dirs_removed')
+
+    mb_freed = summary['bytes_freed'] / (1024 * 1024)
+    print("\n=== Cleanup Summary ===")
+    print(f"Notice dirs removed:     {summary['notice_dirs_removed']}")
+    print(f"Extracted dirs removed:  {summary['extracted_dirs_removed']}")
+    print(f"PIEE debug dirs removed: {summary['piee_debug_dirs_removed']}")
+    print(f"Total freed:             {mb_freed:,.1f} MB")
+    if summary['errors']:
+        print(f"Errors: {len(summary['errors'])}")
+        for err in summary['errors'][:10]:
+            print(f"  - {err}")
+        if len(summary['errors']) > 10:
+            print(f"  ... and {len(summary['errors']) - 10} more")
+
+    return summary
+
 
 def main():
     # Change this URL to any SAM.gov contract URL you want
@@ -1135,7 +1281,11 @@ def test_piee_links(runs_per_link=2):
 
 if __name__ == "__main__":
     import sys
-    if "--test-piee" in sys.argv or "test_piee" in str(sys.argv):
+    if "--cleanup-all" in sys.argv:
+        # Manual backlog cleanup:
+        #   python3 download_sam_files.py --cleanup-all
+        cleanup_all_downloads()
+    elif "--test-piee" in sys.argv or "test_piee" in str(sys.argv):
         runs = 2
         for i, arg in enumerate(sys.argv):
             if arg == "--runs" and i + 1 < len(sys.argv):

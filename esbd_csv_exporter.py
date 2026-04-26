@@ -771,9 +771,20 @@ def processEsbdSolicitationsFromCsv(records, local_contracts_wks, spreadsheet=No
         add_row_to_skipped_contracts, solicitation_exists_in_skipped,
     )
     from config import EAST_TX_COUNTIES
-    
+    from get_empty_rows import (
+        GmailClient, NEXAN_ACCOUNT_CONFIG,
+        create_email_draft, generate_subject_body,
+    )
+
     print(f"Processing {len(records)} ESBD solicitation(s) from CSV...")
     results = []
+
+    print("Authenticating Gmail client for draft creation...")
+    gmail_client = GmailClient(NEXAN_ACCOUNT_CONFIG)
+    if not gmail_client.authenticate():
+        print("⚠️ Failed to authenticate Gmail. Will continue without draft creation.")
+        gmail_client = None
+    gmail_lock = threading.Lock()
     
     # Get the localContracts_skipped worksheet
     skipped_wks = None
@@ -855,9 +866,23 @@ def processEsbdSolicitationsFromCsv(records, local_contracts_wks, spreadsheet=No
             if result['can_apply']:
                 if 'lead_generation' in result and result['lead_generation'] and 'error' not in result['lead_generation']:
                     lead_gen = result['lead_generation']
-                    if "subject" in lead_gen:
-                        lead_gen['subject'] = lead_gen['subject'] + " - texasLocal"
                     reasoning = result.get('reasoning', 'Can apply without additional registration')
+
+                    # Federal-style: OpenAI gives us emails; Gemini fills in subject/body.
+                    complete_text = result.get('complete_text', '') or ''
+                    gemini_subject, gemini_body = (None, None)
+                    if complete_text.strip():
+                        print(f"  Generating subject/body with Gemini (federal-style)...")
+                        try:
+                            gemini_subject, gemini_body = generate_subject_body(complete_text)
+                        except Exception as e:
+                            print(f"  ⚠️ Gemini subject/body generation errored: {e}")
+                    if not gemini_subject or not gemini_body:
+                        print(f"  ⚠️ Gemini subject/body unavailable — Gmail draft will be skipped.")
+
+                    final_subject = (gemini_subject + " - texasLocal") if gemini_subject else "Not found"
+                    final_body = gemini_body if gemini_body else "Not found"
+                    emails_value = lead_gen.get('emails', 'Not found')
 
                     print(f"📤 Uploading files to Google Drive...")
                     if result.get("bonfire_files"):
@@ -876,9 +901,9 @@ def processEsbdSolicitationsFromCsv(records, local_contracts_wks, spreadsheet=No
                             due_date=due_date,
                             status="Can Apply - Leads Generated",
                             reasoning=reasoning,
-                            subject=lead_gen.get('subject', 'Not found'),
-                            body=lead_gen.get('body', 'Not found'),
-                            emails=lead_gen.get('emails', 'Not found'),
+                            subject=final_subject,
+                            body=final_body,
+                            emails=emails_value,
                             folder_link=drive_folder_link,
                             target_row=row
                         )
@@ -892,14 +917,29 @@ def processEsbdSolicitationsFromCsv(records, local_contracts_wks, spreadsheet=No
                                 due_date=due_date,
                                 status=f"Can Apply - Leads Generated ({county} Co.)",
                                 reasoning=reasoning,
-                                subject=lead_gen.get('subject', 'Not found'),
-                                body=lead_gen.get('body', 'Not found'),
-                                emails=lead_gen.get('emails', 'Not found'),
+                                subject=final_subject,
+                                body=final_body,
+                                emails=emails_value,
                                 folder_link=drive_folder_link,
                                 target_row=etx_row
                             )
                             print(f"📍 Record {i}: Also added to eastTX_localContracts (row {etx_row}) — {county} County")
                     print(f"✅ Record {i}: Added to localContracts (row {target_row})")
+
+                    if gmail_client and gemini_subject and gemini_body:
+                        try:
+                            with gmail_lock:
+                                create_email_draft(
+                                    emails_value,
+                                    final_subject,
+                                    final_body,
+                                    gmail_client,
+                                )
+                        except Exception as e:
+                            print(f"⚠️ Record {i}: Failed to create Gmail draft: {e}")
+                    else:
+                        print(f"  Skipping Gmail draft (gmail_client={'ok' if gmail_client else 'missing'}, "
+                              f"subject={'ok' if gemini_subject else 'missing'}, body={'ok' if gemini_body else 'missing'}).")
 
                     results.append({
                         'esbd_url': esbd_url,
@@ -907,9 +947,9 @@ def processEsbdSolicitationsFromCsv(records, local_contracts_wks, spreadsheet=No
                         'name': name,
                         'can_apply': True,
                         'county': county,
-                        'emails': lead_gen.get('emails', 'Not found'),
-                        'subject': lead_gen.get('subject', 'Not found'),
-                        'body': lead_gen.get('body', 'Not found')
+                        'emails': emails_value,
+                        'subject': final_subject,
+                        'body': final_body
                     })
 
                     print(f"✅ Record {i}: Success - leads generated and added to localContracts")

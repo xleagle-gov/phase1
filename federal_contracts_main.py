@@ -7,11 +7,13 @@ A minimalistic version that fetches contracts from SAM.gov, caches them, and pri
 import requests
 import json
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import pygsheets
 from generateLeads import process_single_solicitation, upload_sam_files_to_drive
+from download_sam_files import cleanup_notice_downloads, cleanup_all_downloads
 import time
 import csv
 from runN8nFlows import call_samGovFlow
@@ -43,6 +45,39 @@ CACHE_DIR = CONTRACT_CACHE_DIR
 BLOCKED_URLS = {
     "https://sam.gov/workspace/contract/opp/7ea247ac9ba2400696adf783eccd0853/view",
 }
+
+SOLICITATION_ID_COLUMN = "L"
+SOLICITATION_ID_HEADER = "Solicitation ID"
+SOLICITATION_ID_RE = re.compile(r"\(([^()]+)\)\s*(?:k\d+)?\s*$", re.IGNORECASE)
+TRAILING_DATE_RE = re.compile(r"-20\d{6}$")
+
+
+def normalize_solicitation_id(solicitation_id):
+    solicitation_id = str(solicitation_id or "").strip().upper()
+    return TRAILING_DATE_RE.sub("", solicitation_id)
+
+
+def extract_solicitation_id_from_subject(subject):
+    """Extract the trailing parenthesized solicitation ID from a generated subject."""
+    match = SOLICITATION_ID_RE.search((subject or "").strip())
+    if not match:
+        return None
+    return normalize_solicitation_id(match.group(1))
+
+
+def get_contract_solicitation_id(contract):
+    """Prefer SAM.gov's solicitationNumber, with light fallbacks for cached variants."""
+    for key in ("solicitationNumber", "solicitationId", "solicitation_id"):
+        solicitation_id = normalize_solicitation_id(contract.get(key))
+        if solicitation_id:
+            return solicitation_id
+    return None
+
+
+def ensure_solicitation_id_header(wks):
+    current = (wks.cell(f"{SOLICITATION_ID_COLUMN}1").value or "").strip()
+    if current != SOLICITATION_ID_HEADER:
+        wks.update_value(f"{SOLICITATION_ID_COLUMN}1", SOLICITATION_ID_HEADER)
 
 def fetch_contracts(posted_from, posted_to, use_cache=True):
     """
@@ -130,20 +165,22 @@ def setup_google_sheet():
 
 def load_sheet_state(wks):
     """
-    Read the entire sheet once and return a lookup of existing URLs
-    plus the next available row number.
+    Read the entire sheet once and return lookups of existing SAM URLs and
+    solicitation IDs, plus the next available row number.
 
-    Returns (url_to_row, next_empty_row) where:
+    Returns (url_to_row, solicitation_id_to_row, next_empty_row) where:
       url_to_row  – dict mapping Sam Link → (row_num, record_dict)
+      solicitation_id_to_row – dict mapping Solicitation ID → (row_num, record_dict)
       next_empty_row – first empty row (or row after the last non-empty one)
     """
     try:
         records = wks.get_all_records()
     except Exception as e:
         print(f"Error reading sheet state: {e}")
-        return {}, 2
+        return {}, {}, 2
 
     url_to_row = {}
+    solicitation_id_to_row = {}
     first_empty = None
     last_non_empty = 1
 
@@ -155,8 +192,14 @@ def load_sheet_state(wks):
         elif first_empty is None:
             first_empty = i
 
+        solicitation_id = normalize_solicitation_id(record.get(SOLICITATION_ID_HEADER))
+        if not solicitation_id:
+            solicitation_id = extract_solicitation_id_from_subject(record.get('Email Subject'))
+        if solicitation_id:
+            solicitation_id_to_row[solicitation_id] = (i, record)
+
     next_empty = first_empty if first_empty else last_non_empty + 1
-    return url_to_row, next_empty
+    return url_to_row, solicitation_id_to_row, next_empty
 
 
 def find_link_in_sheet(wks, url):
@@ -232,6 +275,22 @@ def _find_next_empty_row(wks):
     return first_empty if first_empty else last_non_empty + 1
 
 
+def _find_solicitation_id_in_sheet(wks, solicitation_id):
+    """Find an existing row by Solicitation ID, falling back to subject parsing."""
+    solicitation_id = normalize_solicitation_id(solicitation_id)
+    if not solicitation_id:
+        return None, None
+
+    records = wks.get_all_records()
+    for i, record in enumerate(records, start=2):
+        existing_id = normalize_solicitation_id(record.get(SOLICITATION_ID_HEADER))
+        if not existing_id:
+            existing_id = extract_solicitation_id_from_subject(record.get('Email Subject'))
+        if existing_id == solicitation_id:
+            return i, record
+    return None, None
+
+
 def process_contracts_to_sheet(contracts):
     """
     Process filtered contracts:
@@ -244,23 +303,37 @@ def process_contracts_to_sheet(contracts):
     if not wks:
         print("Failed to setup Google Sheets. Skipping sheet operations.")
         return
+    ensure_solicitation_id_header(wks)
 
     # ------------------------------------------------------------------
-    # Bulk-check: read the sheet ONCE to filter out already-processed URLs
+    # Bulk-check: read the sheet ONCE to filter out already-processed solicitations
     # ------------------------------------------------------------------
     print("Loading existing sheet data for duplicate check...")
-    url_to_row, _ = load_sheet_state(wks)
+    url_to_row, solicitation_id_to_row, _ = load_sheet_state(wks)
 
     already_skipped = 0
+    duplicate_in_batch_skipped = 0
     new_contracts = []
     preloaded_rows = {}
+    seen_solicitation_ids = set()
 
     for contract in contracts:
         url = (contract.get('uiLink') or '').strip()
         if not url:
             continue
-        if url in url_to_row:
-            row_num, record = url_to_row[url]
+        solicitation_id = get_contract_solicitation_id(contract)
+        if solicitation_id:
+            if solicitation_id in seen_solicitation_ids:
+                duplicate_in_batch_skipped += 1
+                continue
+            seen_solicitation_ids.add(solicitation_id)
+
+        existing = solicitation_id_to_row.get(solicitation_id) if solicitation_id else None
+        if not existing:
+            existing = url_to_row.get(url)
+
+        if existing:
+            row_num, record = existing
             status = str(record.get('getEmails', '')).strip().lower()
             if status and status != 'processing...':
                 already_skipped += 1
@@ -269,6 +342,7 @@ def process_contracts_to_sheet(contracts):
         new_contracts.append(contract)
 
     print(f"Already processed in sheet: {already_skipped} (skipped)")
+    print(f"Duplicate solicitation IDs in current batch: {duplicate_in_batch_skipped} (skipped)")
     print(f"Remaining to process: {len(new_contracts)}")
 
     if not new_contracts:
@@ -290,15 +364,19 @@ def process_contracts_to_sheet(contracts):
     sheet_lock = threading.Lock()
     test_done = threading.Event() if TEST_SINGLE_CONTRACT else None
 
-    def _write_to_row(url, row_num=None, status_msg=None, result_data=None, contract_data=None):
+    def _write_to_row(url, row_num=None, status_msg=None, result_data=None, contract_data=None, solicitation_id=None):
         """
         Write to the sheet under sheet_lock.  If row_num is None, scans
         for the next empty row fresh each time so we never collide with
         rows added by other scripts or parallel workers.
         """
+        solicitation_id = normalize_solicitation_id(solicitation_id)
+
         if row_num is None:
             row_num = _find_next_empty_row(wks)
             wks.update_value(f'B{row_num}', url)
+        if solicitation_id:
+            wks.update_value(f'{SOLICITATION_ID_COLUMN}{row_num}', solicitation_id)
 
         if status_msg:
             wks.update_value(f'K{row_num}', status_msg)
@@ -324,58 +402,93 @@ def process_contracts_to_sheet(contracts):
         if not url:
             return
 
-        print(f"\n--- Processing Contract: {url} ---")
-
-        row_num = preloaded_rows.get(url)
-
-        resource_links = contract.get('resourceLinks')
         notice_id = contract.get('noticeId')
+        solicitation_id = get_contract_solicitation_id(contract)
 
-        if resource_links:
-            print(f"📥 {len(resource_links)} resource links available for API download")
-        else:
-            print("⚠️ No resource links - will use Selenium fallback if needed")
+        try:
+            print(f"\n--- Processing Contract: {url} ---")
+            if solicitation_id:
+                print(f"Solicitation ID: {solicitation_id}")
 
-        result_data = process_single_solicitation(url, resource_links=resource_links, notice_id=notice_id)
+            row_num = preloaded_rows.get(url)
+            if row_num is None and solicitation_id:
+                with sheet_lock:
+                    row_num, record = _find_solicitation_id_in_sheet(wks, solicitation_id)
+                if row_num:
+                    status = str(record.get('getEmails', '')).strip().lower()
+                    if status and status != 'processing...':
+                        print(f"Skipping existing solicitation {solicitation_id} in row {row_num}")
+                        return
 
-        emails = result_data.get('emails', '') if result_data else ''
-        if not result_data or emails == 'skipped':
-            print(f"Processing failed or was skipped for {url}")
-            with sheet_lock:
-                _write_to_row(url, row_num, status_msg="skipped")
-            return
-        if emails == 'Not found':
-            print(f"Skipping sheet: no vendor/emails found for {url}")
-            with sheet_lock:
-                _write_to_row(url, row_num, status_msg="no emails found")
-            return
-        if isinstance(emails, str) and emails.strip().startswith('ERROR:'):
-            err_preview = emails.strip()[:80] + ('...' if len(emails) > 80 else '')
-            print(f"Skipping sheet: error for {url} - {err_preview}")
-            with sheet_lock:
-                _write_to_row(url, row_num, status_msg=f"error: {err_preview}")
-            return
+            resource_links = contract.get('resourceLinks')
 
-        with sheet_lock:
-            try:
-                target_row = _write_to_row(url, row_num, result_data=result_data, contract_data=contract)
-                print(f"Wrote lead data to row {target_row} for {url}")
-            except Exception as e:
-                print(f"Failed to write lead data for {url}: {e}")
+            if resource_links:
+                print(f"📥 {len(resource_links)} resource links available for API download")
+                if len(resource_links) > 10:
+                    print(f"⏭️ Skipping: {len(resource_links)} files exceeds 10-file limit")
+                    with sheet_lock:
+                        _write_to_row(url, row_num, status_msg="skipped: too many files", solicitation_id=solicitation_id)
+                    return
+            else:
+                print("⚠️ No resource links - will use Selenium fallback if needed")
+
+            result_data = process_single_solicitation(url, resource_links=resource_links, notice_id=notice_id)
+
+            emails = result_data.get('emails', '') if result_data else ''
+            if not result_data or emails == 'skipped':
+                print(f"Processing failed or was skipped for {url}")
+                with sheet_lock:
+                    _write_to_row(url, row_num, status_msg="skipped", solicitation_id=solicitation_id)
+                return
+            if emails == 'Not found':
+                print(f"Skipping sheet: no vendor/emails found for {url}")
+                with sheet_lock:
+                    _write_to_row(url, row_num, status_msg="no emails found", solicitation_id=solicitation_id)
+                return
+            if isinstance(emails, str) and emails.strip().startswith('ERROR:'):
+                err_preview = emails.strip()[:80] + ('...' if len(emails) > 80 else '')
+                print(f"Skipping sheet: error for {url} - {err_preview}")
+                with sheet_lock:
+                    _write_to_row(url, row_num, status_msg=f"error: {err_preview}", solicitation_id=solicitation_id)
                 return
 
-        with sheet_lock:
-            drive_link = wks.cell(f'C{target_row}').value or ""
+            # _write_to_row triggers upload_sam_files_to_drive(url), which reads
+            # the local download directories. We MUST stay inside the try block
+            # until it returns so the finally-cleanup only fires after upload.
+            with sheet_lock:
+                try:
+                    target_row = _write_to_row(
+                        url, row_num, result_data=result_data,
+                        contract_data=contract, solicitation_id=solicitation_id,
+                    )
+                    print(f"Wrote lead data to row {target_row} for {url}")
+                except Exception as e:
+                    print(f"Failed to write lead data for {url}: {e}")
+                    return
 
-        if gmail_client:
-            fresh_token = get_drive_access_token()
-            row_success = process_row(
-                target_row, url, drive_link, emails,
-                wks, fresh_token, gmail_client, sheet_lock,
-            )
-            if row_success and test_done:
-                print(f"\n=== TEST MODE: First fully successful contract done. Stopping. ===")
-                test_done.set()
+            with sheet_lock:
+                drive_link = wks.cell(f'C{target_row}').value or ""
+
+            if gmail_client:
+                fresh_token = get_drive_access_token()
+                row_success = process_row(
+                    target_row, url, drive_link, emails,
+                    wks, fresh_token, gmail_client, sheet_lock,
+                )
+                if row_success and test_done:
+                    print(f"\n=== TEST MODE: First fully successful contract done. Stopping. ===")
+                    test_done.set()
+        finally:
+            # A contract is "done" once its local files are gone.  This runs for
+            # every terminal state (success, skip, error, exception) so the
+            # downloaded_files/ tree never grows unbounded.  Drive upload, if it
+            # was going to happen, has already completed by this point because
+            # _write_to_row calls upload_sam_files_to_drive synchronously.
+            if notice_id:
+                try:
+                    cleanup_notice_downloads(notice_id)
+                except Exception as cleanup_err:
+                    print(f"⚠️  Cleanup failed for notice {notice_id}: {cleanup_err}")
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         executor.map(handle_contract, new_contracts)
